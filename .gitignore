@@ -59,7 +59,6 @@ huggingface/
 # ---- Audio artifacts ----
 # Generated/test audio and the server-side reference voice are not committed.
 # (reference/README.md and reference/.gitkeep are kept — they aren't audio.)
-*.wav
 *.mp3
 *.flac
 *.ogg

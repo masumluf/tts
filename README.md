@@ -1,95 +1,203 @@
-# Bengali TTS Platform
+# Bengali TTS Platform (IndicF5)
 
-An asynchronous Bengali text-to-speech platform split into **two repositories**:
+A production-minded backend that wraps the GPU-bound **IndicF5** text-to-speech
+model behind an asynchronous, multi-user API. You submit Bengali text, the
+service queues the work, a worker runs inference on a separate model server, and
+you download a playable WAV.
 
-| Repo | Stack | Responsibility |
+The interesting part isn't the model call — it's keeping the service responsive
+under concurrent, multi-user load. That design is summarized below and explained
+in depth in **[docs/DECISIONS.md](docs/DECISIONS.md)**.
+
+## How this maps to the brief
+
+| Requirement | Where it lives |
+|---|---|
+| Wrap IndicF5; Bengali text → playable audio | `POST /v1/tts/jobs` → `GET /v1/tts/jobs/:id/audio` (WAV); model in `indicf5-model-server` |
+| Auth / API keys | `src/auth/*` — hashed API keys, `Authorization: Bearer` |
+| Per-user isolation | `src/jobs/*` — every read/download scoped + ownership-checked (403/404) |
+| Concurrency: queue + worker (submit → poll) | `src/queue/*`, `src/workers/*` — BullMQ; API returns `202` immediately |
+| Backpressure / timeouts / rate limiting | per-user rate limit + pending cap (`429`), global queue cap (`503`), job & model timeouts (`504`) |
+| Robustness (oversized/invalid/model-fail/long jobs) | Zod validation, centralized error handler, retries→`failed`, stale-job recovery |
+| Explain trade-offs | [docs/DECISIONS.md](docs/DECISIONS.md), [tts-api-service/docs/ARCHITECTURE.md](tts-api-service/docs/ARCHITECTURE.md) |
+
+## Architecture
+
+Two services, deliberately separate so the heavy Python/GPU runtime scales
+independently of the lightweight API/worker:
+
+| Service | Stack | Responsibility |
 |---|---|---|
-| [`tts-api-service`](tts-api-service) | TypeScript (Node 22 LTS) | Public API, auth, per-user isolation, Postgres source-of-truth, BullMQ queue, worker, Redis recovery, email, alerts, health checks |
-| [`indicf5-model-server`](indicf5-model-server) | Python / FastAPI | Dockerized IndicF5 model; loads once; returns WAV audio; internal-only |
+| [`tts-api-service`](tts-api-service) | TypeScript (Node 22 LTS) | Public API, auth, per-user isolation, Postgres (source of truth), BullMQ queue, worker |
+| [`indicf5-model-server`](indicf5-model-server) | Python / FastAPI | Loads IndicF5 once, synthesizes WAV, internal-only (`X-Internal-Token`) |
 
-The API service **never loads the AI model** — it calls the model server over
-HTTP. Keeping the model in its own repo/image lets the heavy Python+GPU runtime
-scale and deploy independently of the lightweight API/worker.
+```
+Client ──(Bearer key, Bengali text)──> API ──> Postgres (source of truth)
+                                         │
+                                         └──> Redis/BullMQ ──> Worker ──HTTP──> model-server (IndicF5)
+                                                                 │
+                                                                 ├──> object storage (WAV, MinIO/S3)
+                                                                 └──> status → completed/failed
+Client <──(WAV)── API  GET /v1/tts/jobs/:id/audio  (ownership-checked)
+```
+
+**The API never loads the model** — it only enqueues and reads results, so it
+stays responsive no matter how slow inference is.
 
 ## End-to-end flow
 
 ```
-1. Client  POST /v1/tts/jobs  (Bearer API key, Bengali text)
-2. API     validate key, quota, rate limit, size, Bengali text
-3. API     create job in Postgres (status=queued)
-4. API     push job_id to BullMQ (Redis)
-5. API     return job_id immediately (202)
-6. Worker  pick job -> status=processing
-7. Worker  call model-server POST /v1/tts/generate (X-Internal-Token)
-8. Worker  store WAV in object storage
-9. Worker  status=completed -> send success email -> write job_events
-10. Client GET /v1/tts/jobs/:jobId/audio  (ownership checked)
+1. POST /v1/tts/jobs {text}   → validate key, Bengali text, size, quota, rate limit
+2. create job in Postgres (queued) → enqueue job_id to BullMQ → return 202 {job_id}
+3. worker: queued → processing → call model-server → store WAV → completed
+4. GET /v1/tts/jobs/:id        → poll status
+5. GET /v1/tts/jobs/:id/audio  → download WAV (ownership enforced)
 ```
 
-Durability: **Postgres is the source of truth; Redis is only the execution
-queue.** If Redis loses jobs, the recovery service scans Postgres and re-enqueues
-queued/stale/retrying jobs.
+Durability rule: **Postgres is authoritative; Redis is only the execution
+queue.** If Redis loses jobs, the recovery service re-enqueues unfinished ones.
 
-## Contracts
+## Quickstart (one command)
 
-- Public API: [`tts-api-service/docs/API_CONTRACT.md`](tts-api-service/docs/API_CONTRACT.md)
-- Internal model API: [`indicf5-model-server/docs/API_CONTRACT.md`](indicf5-model-server/docs/API_CONTRACT.md)
-
-The shared secret `MODEL_SERVER_INTERNAL_TOKEN` (API) must equal `INTERNAL_TOKEN`
-(model server).
-
-## Run the full stack (local)
+**Prerequisites:** Docker + Docker Compose. A Hugging Face account with access to
+the gated [`ai4bharat/IndicF5`](https://huggingface.co/ai4bharat/IndicF5) model,
+and a reference voice clip. (Everything else — Postgres, Redis, object storage,
+SMTP — runs as containers.)
 
 ```bash
-cp .env.example .env            # set MODEL_SERVER_INTERNAL_TOKEN + API_KEY_PEPPER
-docker compose up --build
+cd ass-sunnah
+cp .env.example .env
 ```
 
-Services and ports:
+Edit `.env` and set at least:
 
-| Service | URL / Port |
+```bash
+API_KEY_PEPPER=<any-random-secret>
+MODEL_SERVER_INTERNAL_TOKEN=<any-random-secret>
+HF_TOKEN=<your-huggingface-read-token>        # IndicF5 is a gated model
+REFERENCE_TEXT=<exact transcript of your reference clip>
+```
+
+Add a reference voice (IndicF5 clones a voice; any supported-language clip works,
+output language follows the request text):
+
+```bash
+# either your own 5–10s mono WAV, or an official sample:
+curl -L "https://github.com/AI4Bharat/IndicF5/raw/refs/heads/main/prompts/MAR_F_WIKI_00001.wav" \
+  -o indicf5-model-server/reference/voice.wav
+# and set REFERENCE_TEXT in .env to that clip's transcript.
+```
+
+Bring up the whole stack (Postgres, Redis, MinIO, MailHog, model server, API,
+worker) and create a user:
+
+```bash
+docker compose up -d --build          # migrate runs automatically; model weights download on first boot
+docker compose run --rm migrate npx tsx prisma/seed.ts   # prints an API key — copy it
+```
+
+### Try it
+
+```bash
+export BASE=http://localhost:3000
+export API_KEY=ttsk_...               # from the seed output
+
+# submit
+curl -s -X POST $BASE/v1/tts/jobs \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+  -d '{"text":"আপনার অডিও তৈরি হয়ে গেছে।"}'
+# -> 202 {"job_id":"...","status":"queued", ...}
+
+# poll
+curl -s $BASE/v1/tts/jobs/<job_id> -H "Authorization: Bearer $API_KEY"
+
+# download when status = completed
+curl -sL $BASE/v1/tts/jobs/<job_id>/audio -H "Authorization: Bearer $API_KEY" -o out.wav
+```
+
+Ports: API `:3000`, model server `:8000`, MinIO console `:9001`, MailHog UI `:8025`.
+
+> First model-server boot downloads multi-GB IndicF5 weights and, on CPU, is
+> slow — this is a demo constraint, not a design limit. See the GPU/scaling notes
+> in [docs/DECISIONS.md](docs/DECISIONS.md).
+
+## Robustness — status codes
+
+| Code | When |
 |---|---|
-| API | http://localhost:3000 |
-| Model server | http://localhost:8000 |
-| Postgres | localhost:5432 |
-| Redis | localhost:6379 |
-| MinIO API / console | http://localhost:9000 / http://localhost:9001 |
-| MailHog UI | http://localhost:8025 |
+| `202` | job accepted (queued) |
+| `400` | empty / non-Bengali / invalid payload |
+| `401` | missing / invalid API key |
+| `403` | accessing another user's job |
+| `404` | job not found / no audio yet |
+| `413` | text exceeds `MAX_TEXT_LENGTH` |
+| `429` | rate limit / too many pending jobs |
+| `503` | global queue full |
+| `504` | model timeout |
 
-Smoke checks (available once the corresponding milestones land):
+## Scaling under load
+
+The design separates "stay responsive" from "go faster":
+
+- **API stays responsive by construction** — it never runs inference, only
+  enqueues and reads, so its latency is independent of model speed and load.
+- **Add workers to drain the queue faster.** Workers are stateless and share the
+  BullMQ queue, so you can scale them out of the box:
+
+  ```bash
+  docker compose up -d --scale worker=3
+  ```
+
+- **The model server is the real throughput unit.** Inference is serialized per
+  model process, so to raise capacity you run more model-server replicas; the
+  workers reach them via the `model-server` service name and Docker DNS
+  round-robins across replicas:
+
+  ```bash
+  # remove the host `ports:` mapping on model-server first (replicas can't share
+  # host port 8000 — it's published only for local debugging), then:
+  docker compose up -d --scale model-server=2 --scale worker=4
+  ```
+
+- **GPU in production.** The local image is CPU-only (Apple Silicon). On a GPU
+  host, build the model image against a CUDA base + CUDA torch wheels and set
+  `MODEL_DEVICE=cuda`; the model is loaded once and kept warm. Autoscaling
+  model-server replicas on BullMQ queue depth (KEDA/HPA) is the natural next
+  step. See [docs/DECISIONS.md](docs/DECISIONS.md) §4.
+
+Backpressure keeps this safe: per-user rate limit + pending cap (`429`) and a
+global queue cap (`503`) shed load before the backlog grows unbounded.
+
+## Testing
 
 ```bash
-curl http://localhost:3000/health
-curl http://localhost:3000/health/dependencies
-curl http://localhost:8000/health
+cd tts-api-service
+npm ci && npm run typecheck && npm test
 ```
 
-## Repository layout
+Unit tests cover per-user isolation, input validation, quota/rate-limit, error
+mapping, and the recovery re-enqueue rules.
 
-```
-.
-├── docker-compose.yml        # full-stack orchestration (both repos + infra)
-├── .env.example              # root compose env
-├── tts-api-service/          # TypeScript API + worker
-└── indicf5-model-server/     # Python/FastAPI IndicF5 server
-```
+## Configuration & contracts
 
-## Build order (milestones)
+- Env reference: [tts-api-service/docs/ENVIRONMENT.md](tts-api-service/docs/ENVIRONMENT.md)
+- Public API contract: [tts-api-service/docs/API_CONTRACT.md](tts-api-service/docs/API_CONTRACT.md)
+- Internal model API contract: [indicf5-model-server/docs/API_CONTRACT.md](indicf5-model-server/docs/API_CONTRACT.md)
+- **Design & trade-offs: [docs/DECISIONS.md](docs/DECISIONS.md)**
+- Architecture & ops: [tts-api-service/docs/ARCHITECTURE.md](tts-api-service/docs/ARCHITECTURE.md)
 
-1. **M1 (done):** repo structure, API contracts, env vars, Docker Compose design.
-2. Database schema (Postgres-native, Prisma).
-3. Auth + per-user isolation.
-4. Job submission API.
-5. Job status + audio APIs.
-6. BullMQ queue.
-7. Worker + model-server integration + storage.
-8. Model server implementation (IndicF5).
-9. Redis disaster recovery.
-10. Incident alerting.
-11. Email notifications.
-12. Health checks.
-13. Error handling.
-14. Documentation + tests.
+## Beyond the brief (production hardening)
 
-Each milestone is delivered independently with run/test instructions and a
-requirements checklist. Standards followed throughout: `tts-api-service/skills.md`.
+These aren't required by the task but are included to show production thinking;
+they're optional and clearly isolated: **email notifications** on completion/
+failure, **incident alerting** (dependency failures / abnormal failure rates),
+and **Redis disaster recovery** (re-enqueue lost/stale jobs from Postgres).
+
+## Infra assumptions
+
+- Local dev runs entirely in Docker (managed Postgres/Redis are supported too —
+  set `DATABASE_URL`/`REDIS_URL`). Redis must allow blocking commands and use
+  `maxmemory-policy noeviction` (set here) for BullMQ.
+- Object storage is S3-compatible (MinIO locally; swap `S3_*` for real S3).
+- The model server is intended to run on GPU in production (`MODEL_DEVICE=cuda`)
+  and scale horizontally; local runs default to CPU.
