@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+
+# do not commit model cache or reference voice assets
+.cache/
+hf_home/
+reference/*.wav
+reference/*.mp3

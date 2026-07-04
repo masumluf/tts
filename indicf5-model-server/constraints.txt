@@ -1,0 +1,10 @@
+# pip constraints — pin the torch stack version for every resolution in the
+# install, including transitive deps pulled by IndicF5 (via f5-tts). Used with
+# `pip install -c constraints.txt ...`.
+#
+# NOTE: no "+cpu" suffix. This image builds for linux/arm64 (Apple Silicon),
+# where PyTorch's normal PyPI wheels are already CPU-only (there is no CUDA on
+# ARM, and "+cpu" wheels only exist for x86_64). On an x86_64 CPU host you would
+# instead use torch==2.5.1+cpu with `--extra-index-url https://download.pytorch.org/whl/cpu`.
+torch==2.5.1
+torchaudio==2.5.1

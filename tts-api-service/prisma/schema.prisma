@@ -1,0 +1,132 @@
+// Prisma schema — Milestone 2.
+// PostgreSQL-native design (skills.md): UUID PKs, timestamptz, native enums,
+// JSONB for flexible metadata, explicit indexes.
+// Postgres is the durable source of truth; Redis is only the execution queue.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------- enums
+
+enum TtsJobStatus {
+  queued
+  processing
+  retrying
+  completed
+  failed
+  timeout
+}
+
+enum JobErrorCode {
+  model_timeout
+  model_error
+  network_error
+  storage_error
+  unknown
+}
+
+enum IncidentSeverity {
+  info
+  warning
+  critical
+}
+
+enum IncidentStatus {
+  open
+  acknowledged
+  resolved
+}
+
+// ---------------------------------------------------------------- models
+
+/// API consumers. Each job belongs to exactly one user (isolation boundary).
+model User {
+  id                 String   @id @default(uuid()) @db.Uuid
+  name               String   @db.VarChar(255)
+  email              String   @unique @db.VarChar(320)
+  /// SHA-256 hash of (api_key + server pepper). Raw keys are never stored.
+  apiKeyHash         String   @unique @map("api_key_hash") @db.VarChar(128)
+  rateLimitPerMinute Int      @default(60) @map("rate_limit_per_minute")
+  monthlyQuota       Int      @default(1000) @map("monthly_quota")
+  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  jobs TtsJob[]
+
+  @@map("users")
+}
+
+/// One text-to-speech generation request. Status transitions are authoritative
+/// here; the BullMQ job only references `id`.
+model TtsJob {
+  id           String        @id @default(uuid()) @db.Uuid
+  userId       String        @map("user_id") @db.Uuid
+  text         String        @db.Text
+  status       TtsJobStatus  @default(queued)
+  retryCount   Int           @default(0) @map("retry_count")
+  maxRetry     Int           @default(3) @map("max_retry")
+  errorCode    JobErrorCode? @map("error_code")
+  errorMessage String?       @map("error_message") @db.Text
+  /// Presigned/public URL to the generated WAV (set on completion).
+  audioUrl     String?       @map("audio_url") @db.Text
+  /// Storage object key/path for the WAV.
+  audioPath    String?       @map("audio_path") @db.Text
+  durationMs   Int?          @map("duration_ms")
+
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  queuedAt    DateTime? @map("queued_at") @db.Timestamptz(6)
+  startedAt   DateTime? @map("started_at") @db.Timestamptz(6)
+  completedAt DateTime? @map("completed_at") @db.Timestamptz(6)
+  failedAt    DateTime? @map("failed_at") @db.Timestamptz(6)
+
+  user   User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  events JobEvent[]
+
+  // Isolation + list queries filter by user_id and order by created_at.
+  @@index([userId, createdAt])
+  // Recovery service scans by status + timestamps.
+  @@index([status, updatedAt])
+  @@map("tts_jobs")
+}
+
+/// Append-only audit trail of what happened to a job (skills.md observability).
+model JobEvent {
+  id        String   @id @default(uuid()) @db.Uuid
+  jobId     String   @map("job_id") @db.Uuid
+  /// Free-form event name driven by JOB_EVENT_TYPE constants in code.
+  eventType String   @map("event_type") @db.VarChar(64)
+  message   String?  @db.Text
+  /// Structured, non-sensitive context (never store secrets here).
+  metadata  Json?    @db.JsonB
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  job TtsJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId, createdAt])
+  @@map("job_events")
+}
+
+/// Operational incidents raised by the alerting subsystem (Phase 10).
+model IncidentAlert {
+  id          String           @id @default(uuid()) @db.Uuid
+  serviceName String           @map("service_name") @db.VarChar(64)
+  severity    IncidentSeverity
+  message     String           @db.Text
+  status      IncidentStatus   @default(open)
+  /// Dedupe key so repeated failures of the same kind don't spam alerts.
+  fingerprint String?          @db.VarChar(128)
+  metadata    Json?            @db.JsonB
+  createdAt   DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([status, createdAt])
+  @@index([serviceName, fingerprint])
+  @@map("incident_alerts")
+}

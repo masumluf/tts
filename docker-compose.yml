@@ -1,0 +1,212 @@
+# =============================================================================
+# Full local stack for the Bengali TTS platform (everything in containers).
+#
+#   - ./tts-api-service      (TypeScript: API + worker, same image, two commands)
+#   - ./indicf5-model-server (Python/FastAPI: IndicF5 model server)
+#
+# Infra: postgres (source of truth), redis (queue), minio (audio storage),
+# mailhog (SMTP capture). The `migrate` service applies the DB schema on startup.
+#
+# Copy .env.example -> .env at the repo root before running:  docker compose up -d --build
+# =============================================================================
+
+# Shared env for the Node services (api, worker, migrate). DB/Redis point at the
+# local postgres/redis containers, so managed URLs in the root .env are ignored.
+x-tts-env: &tts-env
+  NODE_ENV: production
+  PORT: "3000"
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  DATABASE_URL: postgresql://${POSTGRES_USER:-tts}:${POSTGRES_PASSWORD:-tts}@postgres:5432/${POSTGRES_DB:-tts}?schema=public
+  REDIS_URL: redis://redis:6379
+  MODEL_SERVER_URL: http://model-server:8000
+  MODEL_SERVER_INTERNAL_TOKEN: ${MODEL_SERVER_INTERNAL_TOKEN:-change-me-internal-shared-secret}
+  MODEL_SERVER_TIMEOUT_MS: ${MODEL_SERVER_TIMEOUT_MS:-120000}
+  MODEL_SERVER_MAX_RETRIES: ${MODEL_SERVER_MAX_RETRIES:-3}
+  S3_ENDPOINT: http://minio:9000
+  S3_REGION: ${S3_REGION:-us-east-1}
+  S3_BUCKET: ${S3_BUCKET:-tts-audio}
+  S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-minioadmin}
+  S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+  S3_FORCE_PATH_STYLE: "true"
+  SMTP_HOST: mailhog
+  SMTP_PORT: "1025"
+  SMTP_SECURE: "false"
+  EMAIL_FROM: ${EMAIL_FROM:-TTS Service <no-reply@tts.local>}
+  API_KEY_PEPPER: ${API_KEY_PEPPER:-change-me-pepper}
+  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3000}
+  WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-1}
+  RECOVERY_ENABLED: ${RECOVERY_ENABLED:-true}
+  RECOVERY_INTERVAL_MS: ${RECOVERY_INTERVAL_MS:-120000}
+  STALE_PROCESSING_TIMEOUT_MS: ${STALE_PROCESSING_TIMEOUT_MS:-180000}
+  ALERT_SLACK_WEBHOOK_URL: ${ALERT_SLACK_WEBHOOK_URL:-}
+  ALERT_EMAIL_TO: ${ALERT_EMAIL_TO:-oncall@tts.local}
+  MAX_TEXT_LENGTH: ${MAX_TEXT_LENGTH:-5000}
+
+services:
+  # ---------------------------------------------------------------- Postgres
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tts}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tts}
+      POSTGRES_DB: ${POSTGRES_DB:-tts}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tts} -d ${POSTGRES_DB:-tts}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [tts-net]
+
+  # ------------------------------------------------------------------- Redis
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # noeviction is required by BullMQ so queued jobs are never evicted.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [tts-net]
+
+  # ------------------------------------------------------------------- MinIO
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+    ports:
+      - "${MINIO_PORT:-9000}:9000"       # S3 API
+      - "${MINIO_CONSOLE_PORT:-9001}:9001" # web console
+    volumes:
+      - minio-data:/data
+    networks: [tts-net]
+
+  # Creates the audio bucket once MinIO is up, then exits.
+  minio-init:
+    image: minio/mc:latest
+    depends_on: [minio]
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 '${S3_ACCESS_KEY_ID:-minioadmin}' '${S3_SECRET_ACCESS_KEY:-minioadmin}'; do
+        echo 'waiting for minio...'; sleep 2;
+      done;
+      mc mb --ignore-existing local/${S3_BUCKET:-tts-audio};
+      echo 'minio bucket ready';
+      "
+    networks: [tts-net]
+
+  # ----------------------------------------------------------------- MailHog
+  mailhog:
+    image: mailhog/mailhog:latest
+    restart: unless-stopped
+    ports:
+      - "${MAILHOG_SMTP_PORT:-1025}:1025" # SMTP
+      - "${MAILHOG_UI_PORT:-8025}:8025"   # web UI
+    networks: [tts-net]
+
+  # ----------------------------------------------------------------- Migrate
+  # One-shot: applies the Prisma schema to Postgres, then exits. Uses the build
+  # stage image (has the Prisma CLI + tsx). Also the image used to run the seed:
+  #   docker compose run --rm migrate npx tsx prisma/seed.ts
+  migrate:
+    build:
+      context: ./tts-api-service
+      dockerfile: Dockerfile
+      target: build
+    command: ["npx", "prisma", "db", "push", "--skip-generate"]
+    restart: "no"
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      <<: *tts-env
+    networks: [tts-net]
+
+  # ------------------------------------------------------------- Model server
+  model-server:
+    # Apple Silicon: build/run natively as arm64 (fast, and PyTorch's arm64
+    # wheels are CPU-only). On an x86_64 host, remove this line and switch the
+    # torch pins to the +cpu wheels (see indicf5-model-server/constraints.txt).
+    platform: linux/arm64
+    build:
+      context: ./indicf5-model-server
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      APP_PORT: "8000"
+      INTERNAL_TOKEN: ${MODEL_SERVER_INTERNAL_TOKEN:-change-me-internal-shared-secret}
+      MODEL_ID: ${MODEL_ID:-ai4bharat/IndicF5}
+      MODEL_DEVICE: ${MODEL_DEVICE:-cpu}
+      HF_HOME: /app/hf_home
+      # Hugging Face token — required because ai4bharat/IndicF5 is a GATED repo.
+      HF_TOKEN: ${HF_TOKEN:-}
+      REFERENCE_AUDIO_PATH: ${REFERENCE_AUDIO_PATH:-/app/reference/voice.wav}
+      REFERENCE_TEXT: ${REFERENCE_TEXT:-}
+      MAX_TEXT_LENGTH: ${MAX_TEXT_LENGTH:-5000}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "${MODEL_SERVER_PORT:-8000}:8000"
+    volumes:
+      - hf-cache:/app/hf_home
+      # Drop your reference voice.wav into ./indicf5-model-server/reference/.
+      - ./indicf5-model-server/reference:/app/reference:ro
+    networks: [tts-net]
+
+  # --------------------------------------------------------------------- API
+  api:
+    build:
+      context: ./tts-api-service
+      dockerfile: Dockerfile
+    command: ["node", "dist/index.js"]
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio-init: { condition: service_completed_successfully }
+      migrate: { condition: service_completed_successfully }
+    environment:
+      <<: *tts-env
+    ports:
+      - "${API_PORT:-3000}:3000"
+    networks: [tts-net]
+
+  # ------------------------------------------------------------------ Worker
+  # Same image as `api`, different command. Processes the BullMQ queue and calls
+  # the model server. Runs the Redis recovery scan on startup + on interval.
+  worker:
+    build:
+      context: ./tts-api-service
+      dockerfile: Dockerfile
+    command: ["node", "dist/worker.js"]
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio-init: { condition: service_completed_successfully }
+      migrate: { condition: service_completed_successfully }
+      model-server: { condition: service_started }
+    environment:
+      <<: *tts-env
+    networks: [tts-net]
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  hf-cache:
+
+networks:
+  tts-net:
+    driver: bridge
