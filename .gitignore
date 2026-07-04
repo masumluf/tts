@@ -62,6 +62,7 @@ huggingface/
 *.mp3
 *.flac
 *.ogg
+*.wav
 out.wav
 
 # ---- Logs ----
